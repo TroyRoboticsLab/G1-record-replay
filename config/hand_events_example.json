@@ -1,0 +1,20 @@
+{
+  "_comment": "Example Inspire FTP hand schedule for replay_v2.py. Frame numbers are 0-based and match the recorded episode. Raw angle values use the safe band 200..800 (200=closed, 800=open). Named poses: open, close, half, pinch, point, thumbs_up.",
+  "0": {
+    "left": "open",
+    "right": "open"
+  },
+  "80": {
+    "right": "half"
+  },
+  "120": {
+    "right": "close"
+  },
+  "280": {
+    "right": "open"
+  },
+  "300": {
+    "left": "open",
+    "right": "open"
+  }
+}

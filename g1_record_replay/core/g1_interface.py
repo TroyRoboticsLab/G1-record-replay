@@ -134,7 +134,8 @@ DEFAULT_KP = [
     60, 60, 60, 100, 40, 40,      # legs
     60, 40, 40,                   # waist
     40, 40, 40, 40, 40, 40, 40,   # left arm
-    40, 40, 40, 40, 40, 40, 40    # right arm
+    # 40, 40, 40, 40, 40, 40, 40    # right arm
+    65, 65, 65, 65, 65, 65, 65
 ]
 
 DEFAULT_KD = [
@@ -144,6 +145,31 @@ DEFAULT_KD = [
     1, 1, 1, 1, 1, 1, 1,  # left arm
     1, 1, 1, 1, 1, 1, 1   # right arm 
 ]
+
+
+# ---------------------------------------------------------------------------
+# arm_sdk (rt/arm_sdk) support
+#
+# The default record/replay path published to rt/lowcmd AND released the
+# onboard motion controller (MotionSwitcher.ReleaseMode()). That drops the
+# robot into debug mode, so the LEGS are no longer actively balanced/locked.
+#
+# arm_sdk mode instead publishes to rt/arm_sdk and leaves the onboard
+# controller running. A dedicated "weight" joint (index 29) tells the robot to
+# blend in the SDK's upper-body commands while the built-in controller keeps
+# the legs and waist locked and balancing. We additionally hold every non-arm
+# body joint at its captured posture with stiff gains for extra safety.
+# ---------------------------------------------------------------------------
+ARM_SDK_TOPIC = "rt/arm_sdk"
+ARM_SDK_WEIGHT_INDEX = 29  # kNotUsedJoint0: arm_sdk blend weight (0.0=off, 1.0=full)
+
+# Stiff gains used to HOLD legs/waist at their captured position (match the
+# Unitree arm_sdk example: strong motors kp=300, weak ankle-pitch kp=80).
+HOLD_KP_STRONG = 300.0
+HOLD_KP_WEAK = 80.0
+HOLD_KD = 3.0
+# Ankle-pitch joints are "weak" motors and need lower stiffness.
+HOLD_WEAK_MOTORS = {4, 10}  # left_ankle_pitch, right_ankle_pitch
 
 
 class Mode:
@@ -167,17 +193,27 @@ class G1Interface:
     Handles low-level SDK communication and provides clean API.
     """
     
-    def __init__(self, network_interface: Optional[str] = None, use_motion_switcher: bool = False):
+    def __init__(self, network_interface: Optional[str] = None, use_motion_switcher: bool = False,
+                 use_arm_sdk: bool = False):
         """
         Initialize G1 interface.
         
         Args:
             network_interface: Network interface name (e.g., 'enp2s0', 'eth0'). 
                              If None, uses default.
-            use_motion_switcher: Whether to use MotionSwitcherClient (needed for active control)
+            use_motion_switcher: Whether to use MotionSwitcherClient (needed for active control
+                             via rt/lowcmd). WARNING: this releases the onboard controller, so
+                             the legs go limp (debug mode).
+            use_arm_sdk: Whether to control via rt/arm_sdk instead. This keeps the onboard
+                             controller running so the legs/waist stay locked and balancing while
+                             the SDK drives only the arms. Recommended for arms-only record/replay.
         """
+        if use_arm_sdk and use_motion_switcher:
+            raise ValueError("Use either use_arm_sdk or use_motion_switcher, not both.")
+
         self.network_interface = network_interface
         self.use_motion_switcher = use_motion_switcher
+        self.use_arm_sdk = use_arm_sdk
         self.num_motors = G1_NUM_MOTOR
         self.control_dt = 0.002  # 2ms
         
@@ -188,6 +224,10 @@ class G1Interface:
         self.update_mode_machine = False
         self.is_initialized = False
         self.is_control_active = False
+
+        # arm_sdk state
+        self.arm_sdk_weight = 0.0        # current blend weight (0..1)
+        self.hold_positions = None       # captured posture used to hold legs/waist
         
         # SDK objects
         self.msc = None
@@ -211,9 +251,21 @@ class G1Interface:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize channel factory: {e}")
         
-        # Only use motion switcher if we need to control the robot
-        if self.use_motion_switcher:
+        # arm_sdk control: DO NOT release the onboard controller. Publish to
+        # rt/arm_sdk so the robot keeps balancing (legs/waist locked) while we
+        # only drive the arms.
+        if self.use_arm_sdk:
+            print("Initializing arm_sdk control (rt/arm_sdk)...")
+            print("Onboard controller stays active -> legs/waist remain LOCKED.")
+            self.lowcmd_publisher = ChannelPublisher(ARM_SDK_TOPIC, LowCmd_)
+            self.lowcmd_publisher.Init()
+            self.crc = CRC()
+            self.low_cmd = unitree_hg_msg_dds__LowCmd_()
+        # Legacy low-level control (rt/lowcmd). Releases the onboard controller,
+        # which leaves the legs limp. Kept for backward compatibility.
+        elif self.use_motion_switcher:
             print("Initializing motion switcher for robot control...")
+            print("WARNING: this releases the onboard controller -> legs go LIMP.")
             self.msc = MotionSwitcherClient()
             self.msc.SetTimeout(5.0)
             self.msc.Init()
@@ -250,7 +302,9 @@ class G1Interface:
             time.sleep(0.1)
             
         self.is_initialized = True
-        if self.use_motion_switcher:
+        if self.use_arm_sdk:
+            print(f"G1 interface initialized (arm_sdk mode). Mode machine: {self.mode_machine}")
+        elif self.use_motion_switcher:
             print(f"G1 interface initialized successfully. Mode: {self.mode_machine}")
         else:
             print("G1 interface initialized successfully (read-only mode)")
@@ -259,7 +313,7 @@ class G1Interface:
         """Internal callback for low state messages"""
         self.low_state = msg
         
-        if self.use_motion_switcher and not self.update_mode_machine:
+        if (self.use_motion_switcher or self.use_arm_sdk) and not self.update_mode_machine:
             self.mode_machine = self.low_state.mode_machine
             self.update_mode_machine = True
     
@@ -299,8 +353,9 @@ class G1Interface:
         if not self.is_initialized:
             raise RuntimeError("Interface not initialized. Call initialize() first.")
         
-        if not self.use_motion_switcher:
-            raise RuntimeError("Motion switcher not enabled. Initialize with use_motion_switcher=True")
+        if not (self.use_motion_switcher or self.use_arm_sdk):
+            raise RuntimeError("Active control not enabled. Initialize with use_arm_sdk=True "
+                               "(recommended) or use_motion_switcher=True.")
         
         if joint_indices is None:
             joint_indices = list(range(self.num_motors))
@@ -309,7 +364,12 @@ class G1Interface:
         else:
             if not continuous:
                 print(f"Setting {len(joint_indices)} motors to passive mode...")
-            
+
+        # arm_sdk: free the selected (arm) joints while holding legs/waist locked.
+        if self.use_arm_sdk:
+            self._write_arm_sdk(active_indices=joint_indices, passive=True)
+            return
+
         # Set specified motors to disabled with zero gains
         # mode=0: Disable motor control
         # kp=0, kd=0: Zero position and velocity gains
@@ -350,8 +410,9 @@ class G1Interface:
         if not self.is_initialized:
             raise RuntimeError("Interface not initialized. Call initialize() first.")
         
-        if not self.use_motion_switcher:
-            raise RuntimeError("Motion switcher not enabled. Initialize with use_motion_switcher=True")
+        if not (self.use_motion_switcher or self.use_arm_sdk):
+            raise RuntimeError("Active control not enabled. Initialize with use_arm_sdk=True "
+                               "(recommended) or use_motion_switcher=True.")
         
         if len(positions) != self.num_motors:
             raise ValueError(f"Expected {self.num_motors} positions, got {len(positions)}")
@@ -369,7 +430,14 @@ class G1Interface:
         # Determine which joints to command
         if joint_indices is None:
             joint_indices = list(range(self.num_motors))
-        
+
+        # arm_sdk: drive the selected (arm) joints while holding legs/waist locked.
+        if self.use_arm_sdk:
+            self._write_arm_sdk(active_indices=joint_indices, positions=positions,
+                                passive=False, kp=kp, kd=kd,
+                                velocities=velocities, torques=torques)
+            return
+
         # Set command
         self.low_cmd.mode_pr = Mode.PR
         self.low_cmd.mode_machine = self.mode_machine
@@ -386,6 +454,102 @@ class G1Interface:
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.lowcmd_publisher.Write(self.low_cmd)
     
+    # ------------------------------------------------------------------
+    # arm_sdk helpers (keep legs/waist locked while driving the arms)
+    # ------------------------------------------------------------------
+    def capture_hold_positions(self) -> np.ndarray:
+        """
+        Capture the current posture to hold the non-arm joints (legs/waist) at.
+        Call this once, while the robot is standing in its normal (balanced) pose,
+        before starting arm_sdk record/replay.
+        """
+        state = self.get_joint_state()
+        if state is None:
+            raise RuntimeError("Cannot capture hold positions: no robot state received yet.")
+        self.hold_positions = state.positions.copy()
+        return self.hold_positions
+
+    def engage_arm_sdk(self):
+        """Set the arm_sdk blend weight to full (arms driven by SDK, legs stay locked)."""
+        self.arm_sdk_weight = 1.0
+
+    @staticmethod
+    def _hold_gain(joint_index: int):
+        """Return (kp, kd) used to hold a non-arm joint at its captured posture."""
+        if joint_index in HOLD_WEAK_MOTORS:
+            return HOLD_KP_WEAK, HOLD_KD
+        return HOLD_KP_STRONG, HOLD_KD
+
+    def _write_arm_sdk(self, active_indices, positions=None, passive=False,
+                       kp=None, kd=None, velocities=None, torques=None):
+        """
+        Build and publish a single rt/arm_sdk command.
+
+        - active_indices: joints the SDK actively controls (normally the arms).
+          * passive=True  -> those joints get zero gains (free to move by hand).
+          * passive=False -> those joints track `positions` with `kp`/`kd`.
+        - All other body joints (legs/waist) are held at self.hold_positions with
+          stiff gains so the robot stays locked/standing.
+        - The arm_sdk weight joint is set so the onboard controller blends in our
+          commands without giving up leg balancing.
+        """
+        if self.hold_positions is None:
+            self.capture_hold_positions()
+
+        active = set(active_indices)
+        self.low_cmd.mode_pr = Mode.PR
+        self.low_cmd.mode_machine = self.mode_machine
+
+        # Engage arm_sdk blend weight.
+        self.low_cmd.motor_cmd[ARM_SDK_WEIGHT_INDEX].q = float(self.arm_sdk_weight)
+
+        for i in range(self.num_motors):
+            mc = self.low_cmd.motor_cmd[i]
+            if i in active:
+                mc.mode = 1
+                if passive:
+                    mc.q = 0.0
+                    mc.dq = 0.0
+                    mc.tau = 0.0
+                    mc.kp = 0.0
+                    mc.kd = 0.0
+                else:
+                    mc.q = float(positions[i])
+                    mc.dq = float(velocities[i]) if velocities is not None else 0.0
+                    mc.tau = float(torques[i]) if torques is not None else 0.0
+                    mc.kp = float(kp[i]) if kp is not None else float(DEFAULT_KP[i])
+                    mc.kd = float(kd[i]) if kd is not None else float(DEFAULT_KD[i])
+            else:
+                # Hold legs/waist (and any other non-active body joint) firmly.
+                hkp, hkd = self._hold_gain(i)
+                mc.mode = 1
+                mc.q = float(self.hold_positions[i])
+                mc.dq = 0.0
+                mc.tau = 0.0
+                mc.kp = hkp
+                mc.kd = hkd
+
+        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+        self.lowcmd_publisher.Write(self.low_cmd)
+
+    def release_arm_sdk(self, duration: float = 2.0, rate_hz: float = 100.0):
+        """
+        Smoothly hand arm control back to the onboard controller by ramping the
+        arm_sdk weight from its current value down to 0. Legs/waist stay held
+        throughout the ramp.
+        """
+        if not (self.use_arm_sdk and self.is_initialized):
+            return
+        arm_indices = get_joint_indices("arms")
+        steps = max(1, int(duration * rate_hz))
+        try:
+            for w in np.linspace(self.arm_sdk_weight, 0.0, steps):
+                self.arm_sdk_weight = float(w)
+                self._write_arm_sdk(active_indices=arm_indices, passive=True)
+                time.sleep(1.0 / rate_hz)
+        finally:
+            self.arm_sdk_weight = 0.0
+
     def start_control_loop(self, control_function, frequency: float = 500.0):
         """
         Start a control loop at specified frequency.
@@ -421,8 +585,16 @@ class G1Interface:
         if self.is_control_active:
             self.stop_control_loop()
         
-        # Set passive mode before shutdown (only if we have control)
-        if self.is_initialized and self.use_motion_switcher:
+        # arm_sdk: ramp the weight down so the onboard controller resumes arm
+        # control smoothly (legs/waist were never released).
+        if self.is_initialized and self.use_arm_sdk:
+            try:
+                print("Releasing arm_sdk (ramping weight to 0)...")
+                self.release_arm_sdk()
+            except Exception as e:
+                print(f"Warning: Failed to release arm_sdk during shutdown: {e}")
+        # Legacy path: set passive before shutdown (only if we have control)
+        elif self.is_initialized and self.use_motion_switcher:
             try:
                 self.set_passive_mode()
                 time.sleep(0.1)
